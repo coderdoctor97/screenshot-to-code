@@ -1,9 +1,13 @@
+from dataclasses import dataclass
 from enum import Enum
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 
 # Actual model versions that are passed to the LLMs and stored in our logs
 class Llm(Enum):
+    # Custom provider (user-configured Base URL / API key / model).
+    # The concrete model id lives on CustomProviderConfig, not in this enum.
+    CUSTOM = "custom"
     # GPT
     GPT_5_4_MINI_LOW = "gpt-5.4-mini (low thinking)"
     GPT_5_4_2026_03_05_NONE = "gpt-5.4-2026-03-05 (no thinking)"
@@ -65,6 +69,8 @@ class Completion(TypedDict):
 # groupings authoritative and avoids relying on name conventions when checking
 # models elsewhere in the codebase.
 MODEL_PROVIDER: dict[Llm, str] = {
+    # Custom provider models (routed dynamically by CustomProviderConfig)
+    Llm.CUSTOM: "custom",
     # OpenAI models
     Llm.GPT_5_4_MINI_LOW: "openai",
     Llm.GPT_5_4_2026_03_05_NONE: "openai",
@@ -121,6 +127,7 @@ MODEL_PROVIDER: dict[Llm, str] = {
 OPENAI_MODELS = {m for m, p in MODEL_PROVIDER.items() if p == "openai"}
 ANTHROPIC_MODELS = {m for m, p in MODEL_PROVIDER.items() if p == "anthropic"}
 GEMINI_MODELS = {m for m, p in MODEL_PROVIDER.items() if p == "gemini"}
+CUSTOM_MODELS = {m for m, p in MODEL_PROVIDER.items() if p == "custom"}
 
 OPENAI_MODEL_CONFIG: dict[Llm, dict[str, str]] = {
     Llm.GPT_5_4_MINI_LOW: {"api_name": "gpt-5.4-mini", "reasoning_effort": "low"},
@@ -165,3 +172,171 @@ def get_openai_api_name(model: Llm) -> str:
 
 def get_openai_reasoning_effort(model: Llm) -> str | None:
     return OPENAI_MODEL_CONFIG.get(model, {}).get("reasoning_effort")
+
+
+# ---------------------------------------------------------------------------
+# Custom provider support
+#
+# A custom provider lets the user point code generation at any OpenAI- or
+# Anthropic-compatible endpoint (OpenAI, Anthropic, xAI, OpenRouter, Ollama,
+# vLLM, LM Studio, LiteLLM, ...). The user configures a Base URL, an API key,
+# a provider format, and a model id in the Settings UI (or via the
+# CUSTOM_PROVIDER_* env vars); everything here is resolved dynamically at
+# request time instead of from the fixed Llm enum above.
+# ---------------------------------------------------------------------------
+
+CustomProviderFormat = Literal["openai", "anthropic", "xai", "openrouter", "custom"]
+
+CUSTOM_PROVIDER_FORMATS: tuple[str, ...] = (
+    "openai",
+    "anthropic",
+    "xai",
+    "openrouter",
+    "custom",
+)
+
+CUSTOM_PROVIDER_FORMAT_LABELS: dict[str, str] = {
+    "openai": "OpenAI-compatible",
+    "anthropic": "Anthropic-compatible",
+    "xai": "xAI",
+    "openrouter": "OpenRouter",
+    "custom": "Custom (OpenAI-compatible)",
+}
+
+# Default Base URLs applied when the user leaves the Base URL blank.
+CUSTOM_PROVIDER_DEFAULT_BASE_URLS: dict[str, str] = {
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com",
+    "xai": "https://api.x.ai/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "custom": "",
+}
+
+# Formats that speak the Anthropic Messages wire format. Everything else
+# (including "custom") speaks the OpenAI Chat Completions wire format.
+ANTHROPIC_WIRE_FORMATS = frozenset({"anthropic"})
+
+DEFAULT_CUSTOM_PROVIDER_FORMAT = "openai"
+
+# Accepted aliases (e.g. from env vars) for the canonical format names.
+_CUSTOM_PROVIDER_FORMAT_ALIASES: dict[str, str] = {
+    "openai-compatible": "openai",
+    "openai_compatible": "openai",
+    "anthropic-compatible": "anthropic",
+    "anthropic_compatible": "anthropic",
+    "x-ai": "xai",
+    "open-router": "openrouter",
+    "open_router": "openrouter",
+}
+
+
+def normalize_custom_provider_format(value: str | None) -> str:
+    """Return the canonical provider format name for a user-supplied value."""
+    if not value or not isinstance(value, str):
+        return DEFAULT_CUSTOM_PROVIDER_FORMAT
+    normalized = value.strip().lower()
+    if not normalized:
+        return DEFAULT_CUSTOM_PROVIDER_FORMAT
+    if normalized in CUSTOM_PROVIDER_FORMATS:
+        return normalized
+    if normalized in _CUSTOM_PROVIDER_FORMAT_ALIASES:
+        return _CUSTOM_PROVIDER_FORMAT_ALIASES[normalized]
+    # Unknown formats are treated as generic OpenAI-compatible endpoints.
+    return "custom"
+
+
+def custom_provider_wire_format(
+    provider_format: str | None,
+) -> Literal["openai", "anthropic"]:
+    """Return the API wire format ("openai" or "anthropic") for a format name."""
+    if normalize_custom_provider_format(provider_format) in ANTHROPIC_WIRE_FORMATS:
+        return "anthropic"
+    return "openai"
+
+
+def _clean_custom_provider_value(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned if cleaned else None
+
+
+@dataclass
+class CustomProviderConfig:
+    """User-configured custom provider credentials (UI settings or env)."""
+
+    base_url: str | None = None
+    api_key: str | None = None
+    provider_format: str = DEFAULT_CUSTOM_PROVIDER_FORMAT
+    model: str | None = None
+
+    @classmethod
+    def from_values(
+        cls,
+        base_url: object = None,
+        api_key: object = None,
+        provider_format: object = None,
+        model: object = None,
+    ) -> "CustomProviderConfig":
+        """Build a config from raw UI/env values (whitespace-tolerant)."""
+        return cls(
+            base_url=_clean_custom_provider_value(base_url),
+            api_key=_clean_custom_provider_value(api_key),
+            provider_format=normalize_custom_provider_format(
+                provider_format if isinstance(provider_format, str) else None
+            ),
+            model=_clean_custom_provider_value(model),
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        """Whether generation can run on this provider (key + model set)."""
+        return bool(self.api_key and self.model)
+
+    @property
+    def wire_format(self) -> Literal["openai", "anthropic"]:
+        return custom_provider_wire_format(self.provider_format)
+
+    @property
+    def effective_base_url(self) -> str | None:
+        """Explicit Base URL, or the default for the chosen format (if any)."""
+        if self.base_url:
+            return self.base_url.rstrip("/")
+        default = CUSTOM_PROVIDER_DEFAULT_BASE_URLS.get(self.provider_format, "")
+        return default or None
+
+    @property
+    def api_model_name(self) -> str:
+        return self.model or ""
+
+
+def create_custom_openai_client(config: CustomProviderConfig):
+    """Build an AsyncOpenAI client for a custom OpenAI-compatible endpoint.
+
+    The openai package is imported lazily so this module stays importable
+    without third-party dependencies installed.
+    """
+    from openai import AsyncOpenAI
+
+    if not config.api_key:
+        raise ValueError("Custom provider API key is missing.")
+    return AsyncOpenAI(api_key=config.api_key, base_url=config.effective_base_url)
+
+
+def create_custom_anthropic_client(config: CustomProviderConfig):
+    """Build an AsyncAnthropic client for a custom Anthropic-compatible endpoint."""
+    from anthropic import AsyncAnthropic
+
+    if not config.api_key:
+        raise ValueError("Custom provider API key is missing.")
+    kwargs: dict[str, str] = {"api_key": config.api_key}
+    if config.effective_base_url:
+        kwargs["base_url"] = config.effective_base_url
+    return AsyncAnthropic(**kwargs)  # type: ignore[arg-type]
+
+
+def create_custom_provider_client(config: CustomProviderConfig):
+    """Route to the OpenAI or Anthropic SDK client for a custom provider."""
+    if config.wire_format == "anthropic":
+        return create_custom_anthropic_client(config)
+    return create_custom_openai_client(config)
