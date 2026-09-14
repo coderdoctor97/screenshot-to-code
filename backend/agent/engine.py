@@ -6,7 +6,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, cast
 from openai.types.chat import ChatCompletionMessageParam
 
 from codegen.utils import extract_html_content
-from llm import Llm
+from llm import CustomProviderConfig, Llm
 
 from agent.providers.base import ExecutedToolCall, ProviderSession, StreamEvent
 from agent.providers.factory import create_provider_session
@@ -67,6 +67,7 @@ class AgentEngine:
         initial_file_state: Optional[Dict[str, str]] = None,
         option_codes: Optional[List[str]] = None,
         recorder: Optional[AgentRunRecorder] = None,
+        custom_provider: Optional[CustomProviderConfig] = None,
     ):
         self.send_message = send_message
         self.variant_index = variant_index
@@ -78,6 +79,7 @@ class AgentEngine:
         self.replicate_api_key = replicate_api_key
         self.should_generate_images = should_generate_images
         self.should_extract_assets = should_extract_assets
+        self.custom_provider = custom_provider
 
         self.file_state = AgentFileState()
         if initial_file_state and initial_file_state.get("content"):
@@ -350,6 +352,7 @@ class AgentEngine:
                 self.should_extract_assets and bool(self.tool_runtime.input_images)
             ),
             recorder=self.recorder,
+            custom_provider=self.custom_provider,
         )
         try:
             result = await self._run_with_session(session)

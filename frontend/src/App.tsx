@@ -101,6 +101,11 @@ function App() {
       selectedDesignSystemId: null,
       // Only relevant for hosted version
       isTermOfServiceAccepted: false,
+      customProviderBaseUrl: null,
+      customProviderApiKey: null,
+      customProviderFormat: "openai",
+      customProviderModel: null,
+      customProviderModels: [],
     },
     "setting"
   );

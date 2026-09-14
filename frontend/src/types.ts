@@ -12,6 +12,14 @@ export enum AppTheme {
   DARK = "dark",
 }
 
+// Keep in sync with backend (llm.py CUSTOM_PROVIDER_FORMATS)
+export type CustomProviderFormat =
+  | "openai"
+  | "anthropic"
+  | "xai"
+  | "openrouter"
+  | "custom";
+
 export interface Settings {
   openAiApiKey: string | null;
   openAiBaseURL: string | null;
@@ -26,6 +34,13 @@ export interface Settings {
   isTermOfServiceAccepted: boolean;
   anthropicApiKey: string | null;
   geminiApiKey: string | null;
+  // Customized Provider (Settings UI). When an API key and model are set,
+  // all variants run on the custom provider instead of the fixed model sets.
+  customProviderBaseUrl: string | null;
+  customProviderApiKey: string | null;
+  customProviderFormat: CustomProviderFormat;
+  customProviderModel: string | null;
+  customProviderModels: string[];
 }
 
 export interface DesignSystem {

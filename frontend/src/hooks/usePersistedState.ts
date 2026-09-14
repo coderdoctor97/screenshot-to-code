@@ -6,7 +6,21 @@ function usePersistedState<T>(defaultValue: T, key: string): PersistedState<T> {
   const [value, setValue] = useState<T>(() => {
     const value = window.localStorage.getItem(key);
 
-    return value ? (JSON.parse(value) as T) : defaultValue;
+    if (!value) {
+      return defaultValue;
+    }
+    const parsed = JSON.parse(value) as T;
+    // Merge over the defaults so settings stored by older app versions pick
+    // up newly added fields instead of leaving them undefined.
+    if (
+      typeof defaultValue === "object" &&
+      defaultValue !== null &&
+      typeof parsed === "object" &&
+      parsed !== null
+    ) {
+      return { ...defaultValue, ...parsed };
+    }
+    return parsed;
   });
 
   useEffect(() => {

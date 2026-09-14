@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 from openai.types.chat import ChatCompletionMessageParam
 
 from agent.providers.base import (
@@ -134,6 +134,28 @@ def serialize_openai_tools(
             }
         )
     return serialized
+
+
+def serialize_openai_chat_tools(
+    tools: List[CanonicalToolDefinition],
+) -> List[Dict[str, Any]]:
+    """Serialize tools for the Chat Completions API (custom providers).
+
+    Unlike the Responses path above, this intentionally avoids ``strict``
+    schemas: third-party OpenAI-compatible endpoints (OpenRouter, xAI,
+    Ollama, vLLM, ...) rarely implement strict mode.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": _copy_schema(tool.parameters),
+            },
+        }
+        for tool in tools
+    ]
 @dataclass
 class OpenAIResponsesParseState:
     assistant_text: str = ""
@@ -416,6 +438,149 @@ def _build_provider_turn(state: OpenAIResponsesParseState) -> ProviderTurn:
     )
 
 
+@dataclass
+class OpenAIChatParseState:
+    assistant_text: str = ""
+    tool_calls: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    turn_usage: TokenUsage | None = None
+
+
+def _extract_chat_usage(usage: Any) -> TokenUsage:
+    """Extract unified token usage from a Chat Completions usage payload."""
+    prompt_tokens = _get_event_attr(usage, "prompt_tokens", 0) or 0
+    completion_tokens = _get_event_attr(usage, "completion_tokens", 0) or 0
+    total_tokens = _get_event_attr(usage, "total_tokens", 0) or (
+        prompt_tokens + completion_tokens
+    )
+
+    cached_tokens = 0
+    details = _get_event_attr(usage, "prompt_tokens_details")
+    if details is not None:
+        cached_tokens = _get_event_attr(details, "cached_tokens", 0) or 0
+
+    return TokenUsage(
+        input=prompt_tokens - cached_tokens,
+        output=completion_tokens,
+        cache_read=cached_tokens,
+        cache_write=0,
+        total=total_tokens,
+    )
+
+
+async def parse_chat_event(
+    event: Any,
+    state: OpenAIChatParseState,
+    on_event: EventSink,
+) -> None:
+    """Parse one Chat Completions stream chunk (OpenAI-compatible providers)."""
+    usage = _get_event_attr(event, "usage")
+    if usage is not None and _get_event_attr(usage, "prompt_tokens", None) is not None:
+        state.turn_usage = _extract_chat_usage(usage)
+
+    choices = _get_event_attr(event, "choices") or []
+    if not choices:
+        return
+    delta = _get_event_attr(choices[0], "delta")
+    if delta is None:
+        return
+
+    content = _get_event_attr(delta, "content")
+    if content:
+        state.assistant_text += content
+        await on_event(StreamEvent(type="assistant_delta", text=content))
+
+    # Some OpenAI-compatible providers (e.g. DeepSeek-style) stream reasoning
+    # in a separate delta field; surface it as thinking output.
+    reasoning = _get_event_attr(delta, "reasoning_content") or _get_event_attr(
+        delta, "reasoning"
+    )
+    if reasoning:
+        await on_event(StreamEvent(type="thinking_delta", text=reasoning))
+
+    for tool_call in _get_event_attr(delta, "tool_calls") or []:
+        index = _get_event_attr(tool_call, "index", 0) or 0
+        entry = state.tool_calls.setdefault(
+            index, {"id": None, "name": None, "arguments": ""}
+        )
+        call_id = _get_event_attr(tool_call, "id")
+        if call_id:
+            entry["id"] = call_id
+        function = _get_event_attr(tool_call, "function")
+        if function is not None:
+            name = _get_event_attr(function, "name")
+            if name:
+                entry["name"] = name
+            arguments = _get_event_attr(function, "arguments") or ""
+            entry["arguments"] += ensure_str(arguments)
+
+        await on_event(
+            StreamEvent(
+                type="tool_call_delta",
+                tool_call_id=entry.get("id"),
+                tool_name=entry.get("name"),
+                tool_arguments=entry.get("arguments"),
+            )
+        )
+
+
+def _build_chat_provider_turn(state: OpenAIChatParseState) -> ProviderTurn:
+    tool_calls: List[ToolCall] = []
+    raw_calls: List[Dict[str, Any]] = []
+    for index in sorted(state.tool_calls.keys()):
+        entry = state.tool_calls[index]
+        raw_args = entry.get("arguments") or ""
+        args, error = parse_json_arguments(raw_args)
+        if error:
+            args = {"INVALID_JSON": ensure_str(raw_args)}
+        call_id = entry.get("id") or f"call-{uuid.uuid4().hex[:6]}"
+        name = entry.get("name") or "unknown_tool"
+        tool_calls.append(ToolCall(id=call_id, name=name, arguments=args))
+        raw_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": (
+                        raw_args if isinstance(raw_args, str) else json.dumps(raw_args)
+                    ),
+                },
+            }
+        )
+
+    assistant_message: Dict[str, Any] = {
+        "role": "assistant",
+        "content": state.assistant_text or None,
+    }
+    if raw_calls:
+        assistant_message["tool_calls"] = raw_calls
+
+    return ProviderTurn(
+        assistant_text=state.assistant_text,
+        tool_calls=tool_calls,
+        assistant_turn=assistant_message,
+    )
+
+
+def _is_chat_param_compat_error(error: Exception) -> bool:
+    """Whether a 400 looks like an unsupported Chat Completions parameter.
+
+    Third-party endpoints vary in which parameters they accept
+    (``stream_options``, ``max_tokens`` vs ``max_completion_tokens``), so the
+    chat path retries with progressively simpler parameters on such errors.
+    """
+    message = str(getattr(error, "message", error)).lower()
+    return any(
+        keyword in message
+        for keyword in (
+            "stream_options",
+            "include_usage",
+            "max_tokens",
+            "max_completion_tokens",
+        )
+    )
+
+
 class OpenAIProviderSession(ProviderSession):
     def __init__(
         self,
@@ -424,25 +589,37 @@ class OpenAIProviderSession(ProviderSession):
         prompt_messages: List[ChatCompletionMessageParam],
         tools: List[Dict[str, Any]],
         recorder: Optional[AgentRunRecorder] = None,
+        api_model_name: str | None = None,
+        use_chat_completions: bool = False,
     ):
         self._client = client
         self._model = model
         self._tools = tools
+        self._api_model_name = api_model_name or get_openai_api_name(model)
+        self._use_chat_completions = use_chat_completions
         self._total_usage = TokenUsage()
         self._recorder = recorder
         self._prompt_report_logger = PromptReportLogger(
             provider="openai",
             model=model,
-            api_model_name=get_openai_api_name(model),
+            api_model_name=self._api_model_name,
         )
-        image_detail = _get_image_detail_for_model(model)
-        self._input_items: List[Dict[str, Any]] = [
-            _convert_message_to_responses_input(message, image_detail=image_detail)
-            for message in prompt_messages
-        ]
+        self._input_items: List[Dict[str, Any]] = []
+        self._messages: List[Dict[str, Any]] = []
+        if use_chat_completions:
+            # Chat Completions consumes the OpenAI chat message shape directly.
+            self._messages = [copy.deepcopy(dict(message)) for message in prompt_messages]
+        else:
+            image_detail = _get_image_detail_for_model(model)
+            self._input_items = [
+                _convert_message_to_responses_input(message, image_detail=image_detail)
+                for message in prompt_messages
+            ]
 
     async def stream_turn(self, on_event: EventSink) -> ProviderTurn:
-        model_name = get_openai_api_name(self._model)
+        if self._use_chat_completions:
+            return await self._stream_chat_turn(on_event)
+        model_name = self._api_model_name
         params: Dict[str, Any] = {
             "model": model_name,
             "input": self._input_items,
@@ -477,8 +654,62 @@ class OpenAIProviderSession(ProviderSession):
             )
         return turn
 
+    async def _create_chat_stream(self, params: Dict[str, Any]) -> Any:
+        """Create a Chat Completions stream, adapting params to the endpoint.
+
+        Providers disagree on ``stream_options`` and on ``max_tokens`` vs
+        ``max_completion_tokens``; retry with simpler variants when the
+        endpoint rejects one (other errors propagate immediately).
+        """
+        param_variants = [
+            {"max_tokens": 16384, "stream_options": {"include_usage": True}},
+            {"max_tokens": 16384},
+            {"max_completion_tokens": 16384},
+        ]
+        last_error: Exception | None = None
+        for extra in param_variants:
+            try:
+                return await self._client.chat.completions.create(**params, **extra)  # type: ignore
+            except BadRequestError as e:
+                if not _is_chat_param_compat_error(e):
+                    raise
+                last_error = e
+                continue
+        assert last_error is not None
+        raise last_error
+
+    async def _stream_chat_turn(self, on_event: EventSink) -> ProviderTurn:
+        params: Dict[str, Any] = {
+            "model": self._api_model_name,
+            "messages": self._messages,
+            "stream": True,
+        }
+        if self._tools:
+            params["tools"] = self._tools
+            params["tool_choice"] = "auto"
+
+        self._prompt_report_logger.record_request(params)
+        if self._recorder is not None:
+            self._recorder.record_llm_request("openai", self._api_model_name, params)
+
+        state = OpenAIChatParseState()
+        stream = await self._create_chat_stream(params)
+        async for event in stream:
+            await parse_chat_event(event, state, on_event)
+
+        if state.turn_usage is not None:
+            self._prompt_report_logger.record_usage(state.turn_usage)
+            self._total_usage.accumulate(state.turn_usage)
+
+        turn = _build_chat_provider_turn(state)
+        if self._recorder is not None:
+            self._recorder.record_llm_response(
+                turn.assistant_text, turn.tool_calls, state.turn_usage
+            )
+        return turn
+
     def total_cost_usd(self) -> float | None:
-        pricing = MODEL_PRICING.get(get_openai_api_name(self._model))
+        pricing = MODEL_PRICING.get(self._api_model_name)
         if pricing is None:
             return None
         return self._total_usage.cost(pricing)
@@ -498,6 +729,37 @@ class OpenAIProviderSession(ProviderSession):
         turn: ProviderTurn,
         executed_tool_calls: list[ExecutedToolCall],
     ) -> None:
+        if self._use_chat_completions:
+            assistant_message = turn.assistant_turn or {
+                "role": "assistant",
+                "content": turn.assistant_text or None,
+            }
+            self._messages.append(assistant_message)
+            for executed in executed_tool_calls:
+                result_json = json.dumps(executed.result.result)
+                parts = executed.result.multimodal_parts or []
+                content: Any = result_json
+                if parts and executed.result.ok:
+                    content = [{"type": "text", "text": result_json}]
+                    for part in parts:
+                        image_url = self._image_ref(part)
+                        if image_url is None:
+                            continue
+                        content.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_url},
+                            }
+                        )
+                self._messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": executed.tool_call.id,
+                        "content": content,
+                    }
+                )
+            return
+
         assistant_output_items = turn.assistant_turn or []
         if assistant_output_items:
             self._input_items.extend(assistant_output_items)
@@ -535,7 +797,7 @@ class OpenAIProviderSession(ProviderSession):
 
     async def close(self) -> None:
         u = self._total_usage
-        model_name = get_openai_api_name(self._model)
+        model_name = self._api_model_name
         pricing = MODEL_PRICING.get(model_name)
         cost_str = f" cost=${u.cost(pricing):.4f}" if pricing else ""
         cache_hit_rate_str = f" cache_hit_rate={u.cache_hit_rate_percent():.2f}%"

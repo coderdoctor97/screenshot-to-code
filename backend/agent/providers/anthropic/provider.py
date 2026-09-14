@@ -326,16 +326,28 @@ class AnthropicProviderSession(ProviderSession):
         prompt_messages: List[ChatCompletionMessageParam],
         tools: List[Dict[str, Any]],
         recorder: Optional[AgentRunRecorder] = None,
+        api_model_name: str | None = None,
     ):
         self._client = client
         self._model = model
-        self._tools = tools
+        self._api_model_name = api_model_name or _get_anthropic_api_model_name(model)
+        # Custom providers run without vendor-specific extras (prompt caching,
+        # eager input streaming, adaptive thinking) that third-party
+        # Anthropic-compatible endpoints may not implement.
+        self._is_custom = api_model_name is not None
+        if self._is_custom:
+            self._tools = [
+                {k: v for k, v in tool.items() if k != "eager_input_streaming"}
+                for tool in tools
+            ]
+        else:
+            self._tools = tools
         self._total_usage = TokenUsage()
         self._recorder = recorder
         self._prompt_report_logger = PromptReportLogger(
             provider="anthropic",
             model=model,
-            api_model_name=_get_anthropic_api_model_name(model),
+            api_model_name=self._api_model_name,
         )
         system_prompt, claude_messages = _convert_openai_messages_to_claude(prompt_messages)
         self._system_prompt = system_prompt
@@ -357,15 +369,16 @@ class AnthropicProviderSession(ProviderSession):
         # call so crossing 20 images cannot leave earlier images above 2000 px.
         self._ensure_many_image_dimension_limit()
         stream_kwargs: Dict[str, Any] = {
-            "model": _get_anthropic_api_model_name(self._model),
+            "model": self._api_model_name,
             "max_tokens": 50000,
             "system": self._system_prompt,
             "messages": self._messages,
             "tools": self._tools,
-            "cache_control": {"type": "ephemeral"},
         }
+        if not self._is_custom:
+            stream_kwargs["cache_control"] = {"type": "ephemeral"}
 
-        if self._model.value in ADAPTIVE_THINKING_MODELS:
+        if self._model.value in ADAPTIVE_THINKING_MODELS and not self._is_custom:
             stream_kwargs["thinking"] = {
                 "type": "adaptive",
             }
@@ -383,7 +396,7 @@ class AnthropicProviderSession(ProviderSession):
         self._prompt_report_logger.record_request(stream_kwargs)
         if self._recorder is not None:
             self._recorder.record_llm_request(
-                "anthropic", _get_anthropic_api_model_name(self._model), stream_kwargs
+                "anthropic", self._api_model_name, stream_kwargs
             )
 
         state = AnthropicParseState()
@@ -408,7 +421,7 @@ class AnthropicProviderSession(ProviderSession):
         )
 
     def total_cost_usd(self) -> Optional[float]:
-        pricing = MODEL_PRICING.get(_get_anthropic_api_model_name(self._model))
+        pricing = MODEL_PRICING.get(self._api_model_name)
         if pricing is None:
             return None
         return self._total_usage.cost(pricing)
@@ -495,8 +508,8 @@ class AnthropicProviderSession(ProviderSession):
 
     async def close(self) -> None:
         u = self._total_usage
-        model_name = self._model.value
-        pricing = MODEL_PRICING.get(_get_anthropic_api_model_name(self._model))
+        model_name = self._api_model_name
+        pricing = MODEL_PRICING.get(model_name)
         cost_str = f" cost=${u.cost(pricing):.4f}" if pricing else ""
         cache_hit_rate_str = f" cache_hit_rate={u.cache_hit_rate_percent():.2f}%"
         print(

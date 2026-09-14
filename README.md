@@ -15,12 +15,11 @@ Supported stacks:
 - Bootstrap
 - Ionic + Tailwind
 
-Default AI models:
-
-- Gemini 3 Flash Preview and Gemini 3.1 Pro Preview - the best models
-- GPT-5.5 and GPT-5.4 Mini
-- Claude Opus 4.6, Claude Opus 4.8
-- z-image-turbo (using Replicate) for image generation
+AI models are fully configurable: use the **Customized Provider** section in the
+in-app Settings (gear icon) to point code generation at any OpenAI- or
+Anthropic-compatible endpoint — OpenAI, Anthropic, xAI, OpenRouter, Ollama,
+vLLM, or your own gateway — by setting a Base URL, API key, provider format,
+and model. z-image-turbo (using Replicate) is used for image generation.
 
 See the [Examples](#-examples) section below for more demos.
 
@@ -39,32 +38,37 @@ Running locally requires API keys and a backend/frontend setup. The app has a Re
 
 ### API keys
 
-You need **at least one** model provider key (OpenAI, Anthropic, or Gemini).
-**Gemini and Replicate are strongly recommended for the best quality of
-screenshot-to-code accuracy** — Gemini powers asset extraction (reusing the
-real logos/images from your screenshot) and Replicate powers image
-generation, background removal, and image editing. Adding all four keys gives
-the best results and lets you compare multiple models per generation.
+The recommended setup is the **Customized Provider** in the in-app Settings
+dialog (click the gear icon after loading the app): enter a Base URL, an API
+key, pick a provider format (OpenAI-compatible, Anthropic-compatible, xAI,
+OpenRouter, or Custom), fetch the model list, and select a model. When a
+custom API key and model are set, all variants run on your custom provider.
+
+Alternatively, the same credentials can be set server-side via environment
+variables (restart the backend after editing `backend/.env`):
 
 | Key | Required? | What it unlocks |
 |-----|-----------|-----------------|
-| `OPENAI_API_KEY` | One of these three | GPT code-gen variants (GPT-5.5, GPT-5.4 Mini) |
-| `ANTHROPIC_API_KEY` | One of these three | Claude code-gen variants (Opus 5, Opus 4.8, Fable 5, Sonnet 4.6) |
-| `GEMINI_API_KEY` | One of these three — **strongly recommended** | Gemini code-gen variants (3 Flash, 3.1 Pro); extracts real assets from the screenshot; required for video mode |
+| `CUSTOM_PROVIDER_API_KEY` | Yes (for custom-provider mode) | Authenticates your custom endpoint |
+| `CUSTOM_PROVIDER_MODEL` | Yes (for custom-provider mode) | The model id to generate with (e.g. `gpt-4o`, `claude-opus-4-8`, `xai/grok-4`) |
+| `CUSTOM_PROVIDER_BASE_URL` | Only for `custom` / self-hosted formats | Your endpoint's base URL (e.g. `https://your-host/v1`); the known formats default to their public APIs |
+| `CUSTOM_PROVIDER_FORMAT` | No (defaults to `openai`) | `openai`, `anthropic`, `xai`, `openrouter`, or `custom` |
 | `REPLICATE_API_KEY` | **Strongly recommended** | Image editing, background removal, and Replicate-backed image generation — without it, `edit_images` and `remove_backgrounds` are unavailable |
+| `GEMINI_API_KEY` | Optional | Asset extraction (reusing the real logos/images from your screenshot); required for video mode |
 
-With more keys, the app automatically picks a stronger mix of models per
-variant; with a single key it uses that provider's models only.
+Legacy `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` configuration
+is still supported as a fallback when no custom provider is configured: with
+those keys the app picks from its fixed model sets per variant.
 
-If you'd like to run the app with Ollama open-source models (not recommended due to poor-quality results), [follow this comment](https://github.com/abi/screenshot-to-code/issues/354#issuecomment-2435479853).
+If you'd like to run the app with Ollama open-source models (not recommended due to poor-quality results), configure a Customized Provider with format `custom`, Base URL `http://localhost:11434/v1`, and your Ollama model id.
 
 Run the backend (I use Poetry for package management; run `pip install --upgrade poetry` if you don't have it):
 
 ```bash
 cd backend
-echo "OPENAI_API_KEY=sk-your-key" > .env
-echo "ANTHROPIC_API_KEY=your-key" >> .env
-echo "GEMINI_API_KEY=your-key" >> .env
+echo "CUSTOM_PROVIDER_API_KEY=sk-your-key" > .env
+echo "CUSTOM_PROVIDER_MODEL=your-model-id" >> .env
+# Optional: CUSTOM_PROVIDER_BASE_URL and CUSTOM_PROVIDER_FORMAT (default: openai)
 echo "REPLICATE_API_KEY=r8_your-key" >> .env
 poetry install
 # Install the Chromium browser used by the screenshot preview tool.
@@ -76,7 +80,7 @@ poetry env activate
 poetry run uvicorn main:app --reload --port 7001
 ```
 
-You can also set up OpenAI, Anthropic, and Gemini keys using the settings dialog in the frontend (click the gear icon after loading the app). Replicate must be configured in `backend/.env` as `REPLICATE_API_KEY`. The Settings dialog also shows whether **screenshot preview** is available on your backend.
+You can also set up the custom provider (Base URL, API key, format, and model) using the settings dialog in the frontend (click the gear icon after loading the app) — UI values override `backend/.env`. Replicate must be configured in `backend/.env` as `REPLICATE_API_KEY`. The Settings dialog also shows whether **screenshot preview** is available on your backend.
 
 > **Screenshot preview** (optional) lets the agent render its own generated page in a headless browser and visually check its work. It's enabled automatically once Chromium is installed (the `playwright install chromium` step above, or automatically in the Docker image). If Chromium is missing, the app just skips the tool — the Settings dialog shows whether it's available.
 
@@ -97,7 +101,8 @@ If you prefer to run the backend on a different port, update `VITE_WS_BACKEND_UR
 If you have Docker installed, run this from the root directory:
 
 ```bash
-echo "OPENAI_API_KEY=sk-your-key" > .env
+echo "CUSTOM_PROVIDER_API_KEY=sk-your-key" > .env
+echo "CUSTOM_PROVIDER_MODEL=your-model-id" >> .env
 docker-compose up -d --build
 ```
 
@@ -107,7 +112,7 @@ The app will be up and running at http://localhost:5173. Note that you can't dev
 
 - **I'm running into an error when setting up the backend. How can I fix it?** [Try this](https://github.com/abi/screenshot-to-code/issues/3#issuecomment-1814777959). If that still doesn't work, open an issue.
 - **How do I get an OpenAI API key?** See https://github.com/abi/screenshot-to-code/blob/main/Troubleshooting.md
-- **How can I configure an OpenAI proxy?** If you're not able to access the OpenAI API directly, for example because of country restrictions, you can try a VPN or configure the OpenAI base URL to use a proxy. Set `OPENAI_BASE_URL` in `backend/.env` or directly in the UI in the settings dialog. Make sure the URL has `v1` in the path, for example: `https://xxx.xxxxx.xxx/v1`.
+- **How can I configure an OpenAI proxy or a third-party endpoint?** Use the Customized Provider in the Settings dialog (or the `CUSTOM_PROVIDER_*` variables in `backend/.env`): pick the matching provider format and set the Base URL to your proxy/gateway, e.g. `https://xxx.xxxxx.xxx/v1` for OpenAI-compatible endpoints. This works with OpenRouter, xAI, Ollama, vLLM, LiteLLM, and other OpenAI- or Anthropic-compatible services.
 - **How can I update the backend host that my frontend connects to?** Configure `VITE_HTTP_BACKEND_URL` and `VITE_WS_BACKEND_URL` in `frontend/.env.local`. For example, set `VITE_HTTP_BACKEND_URL=http://124.10.20.1:7001`.
 - **Seeing UTF-8 errors when running the backend?** On Windows, open the `.env` file with Notepad++, then go to Encoding and select UTF-8.
 - **How can I provide feedback?** For feedback, feature requests, and bug reports, open an issue or ping me on [Twitter](https://twitter.com/_abi_).

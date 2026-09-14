@@ -9,6 +9,17 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", None)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", None)
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", None)
 
+# Custom provider (user-configured in the Settings UI; these env vars are the
+# server-side fallback when the UI fields are left blank). When an API key and
+# a model are set, all variants run on the custom provider instead of the
+# fixed OpenAI/Anthropic/Gemini model sets.
+CUSTOM_PROVIDER_BASE_URL = os.environ.get("CUSTOM_PROVIDER_BASE_URL", None)
+CUSTOM_PROVIDER_API_KEY = os.environ.get("CUSTOM_PROVIDER_API_KEY", None)
+CUSTOM_PROVIDER_FORMAT = os.environ.get(
+    "CUSTOM_PROVIDER_FORMAT", "openai"
+)  # openai | anthropic | xai | openrouter | custom
+CUSTOM_PROVIDER_MODEL = os.environ.get("CUSTOM_PROVIDER_MODEL", None)
+
 # Image generation (optional)
 REPLICATE_API_KEY = os.environ.get("REPLICATE_API_KEY", None)
 

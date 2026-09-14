@@ -11,6 +11,10 @@ from starlette.websockets import WebSocketDisconnect
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from config import (
     ANTHROPIC_API_KEY,
+    CUSTOM_PROVIDER_API_KEY,
+    CUSTOM_PROVIDER_BASE_URL,
+    CUSTOM_PROVIDER_FORMAT,
+    CUSTOM_PROVIDER_MODEL,
     GEMINI_API_KEY,
     IS_DEBUG_ENABLED,
     IS_PROD,
@@ -22,6 +26,7 @@ from config import (
 )
 from custom_types import InputMode
 from llm import (
+    CustomProviderConfig,
     Llm,
 )
 from typing import (
@@ -268,6 +273,7 @@ class ExtractedParams:
     should_extract_assets: bool = True
     asset_base_url: str = ""
     design_system: str | None = None
+    custom_provider: CustomProviderConfig | None = None
 
 
 class ParameterExtractionStage:
@@ -323,6 +329,30 @@ class ParameterExtractionStage:
             )
         if not openai_base_url:
             print("Using official OpenAI URL")
+
+        # Custom provider (Settings UI "Customized Provider" section, with
+        # CUSTOM_PROVIDER_* env vars as fallback). Unlike openAiBaseURL this
+        # is honored in every environment: a custom Base URL is the point.
+        custom_provider = CustomProviderConfig.from_values(
+            base_url=self._get_from_settings_dialog_or_env(
+                params, "customProviderBaseUrl", CUSTOM_PROVIDER_BASE_URL
+            ),
+            api_key=self._get_from_settings_dialog_or_env(
+                params, "customProviderApiKey", CUSTOM_PROVIDER_API_KEY
+            ),
+            provider_format=self._get_from_settings_dialog_or_env(
+                params, "customProviderFormat", CUSTOM_PROVIDER_FORMAT
+            ),
+            model=self._get_from_settings_dialog_or_env(
+                params, "customProviderModel", CUSTOM_PROVIDER_MODEL
+            ),
+        )
+        if custom_provider.is_configured:
+            print(
+                "Using custom provider "
+                f"(format={custom_provider.provider_format}, "
+                f"model={custom_provider.api_model_name})"
+            )
 
         # Feature preferences default to enabled for older clients.
         should_generate_images = bool(params.get("isImageGenerationEnabled", True))
@@ -390,6 +420,7 @@ class ParameterExtractionStage:
             option_codes=option_codes,
             asset_base_url=self.asset_base_url,
             design_system=design_system,
+            custom_provider=custom_provider,
         )
 
     def _get_from_settings_dialog_or_env(
@@ -421,9 +452,28 @@ class ModelSelectionStage:
         openai_api_key: str | None,
         anthropic_api_key: str | None,
         gemini_api_key: str | None = None,
+        custom_provider: CustomProviderConfig | None = None,
     ) -> List[Llm]:
         """Select appropriate models based on available API keys"""
         try:
+            # A configured custom provider takes precedence over the fixed
+            # model sets: every variant runs on the user's chosen model.
+            if custom_provider is not None and custom_provider.is_configured:
+                if input_mode == "video":
+                    num_variants = NUM_VARIANTS_VIDEO
+                elif generation_type == "update":
+                    num_variants = 2
+                else:
+                    num_variants = NUM_VARIANTS
+                variant_models = [Llm.CUSTOM] * num_variants
+                print("Variant models:")
+                for index, model in enumerate(variant_models):
+                    print(
+                        f"Variant {index + 1}: custom "
+                        f"({custom_provider.api_model_name})"
+                    )
+                return variant_models
+
             num_variants = 2 if generation_type == "update" else NUM_VARIANTS
             variant_models = self._get_variant_models(
                 generation_type,
@@ -443,7 +493,8 @@ class ModelSelectionStage:
         except Exception:
             await self.throw_error(
                 "No OpenAI, Anthropic, or Gemini API key found. Please add the environment variable "
-                "OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY to backend/.env or in the settings dialog. "
+                "OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY to backend/.env or in the settings dialog, "
+                "or configure a Customized Provider (Base URL, API key, and model) in the settings dialog. "
                 "If you add it to .env, make sure to restart the backend server."
             )
             raise Exception("No API key")
@@ -566,6 +617,7 @@ class AgenticGenerationStage:
         stack: str | None = None,
         input_mode: str | None = None,
         generation_type: str | None = None,
+        custom_provider: CustomProviderConfig | None = None,
     ):
         self.send_message = send_message
         self.openai_api_key = openai_api_key
@@ -573,6 +625,7 @@ class AgenticGenerationStage:
         self.anthropic_api_key = anthropic_api_key
         self.gemini_api_key = gemini_api_key
         self.replicate_api_key = replicate_api_key
+        self.custom_provider = custom_provider
         self.should_generate_images = should_generate_images
         self.should_extract_assets = should_extract_assets
         self.file_state = file_state
@@ -654,6 +707,7 @@ class AgenticGenerationStage:
                 initial_file_state=self.file_state,
                 option_codes=self.option_codes,
                 recorder=recorder,
+                custom_provider=self.custom_provider,
             )
             completion = await runner.run(model, prompt_messages)
             if completion:
@@ -815,6 +869,7 @@ class CodeGenerationMiddleware(Middleware):
                 openai_api_key=context.extracted_params.openai_api_key,
                 anthropic_api_key=context.extracted_params.anthropic_api_key,
                 gemini_api_key=context.extracted_params.gemini_api_key,
+                custom_provider=context.extracted_params.custom_provider,
             )
             if IS_DEBUG_ENABLED:
                 await context.send_message(
@@ -840,6 +895,7 @@ class CodeGenerationMiddleware(Middleware):
                 stack=str(context.extracted_params.stack),
                 input_mode=str(context.extracted_params.input_mode),
                 generation_type=context.extracted_params.generation_type,
+                custom_provider=context.extracted_params.custom_provider,
             )
 
             context.variant_completions = await generation_stage.process_variants(
